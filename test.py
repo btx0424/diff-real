@@ -35,12 +35,12 @@ config = TrainingConfig()
 def make_dataset(path: str, seq_len = 64):
     trajs = torch.load(path)
     print(trajs)
-    trajs = trajs["action"][:, :]
+    trajs = trajs["state_"][:, :, :3]
     
-    # plt.plot(trajs[0, :200, 0])
-    # plt.plot(trajs[0, :200, 1])
-    # plt.plot(trajs[0, :200, 2])
-    # plt.show()
+    plt.plot(trajs[0, :500, 0])
+    plt.plot(trajs[0, :500, 1])
+    plt.plot(trajs[0, :500, 2])
+    plt.show()
     
     N, T = trajs.shape[:2]
     T = (T // seq_len) * seq_len
@@ -68,7 +68,7 @@ def main():
         x = einops.rearrange(x, 'b t d -> b d t')
         print(x.shape)
 
-    dataset = make_dataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-23_19-14.pt")
+    dataset = make_dataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-24_16-27.pt")
     # dataset = x
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=256)
     
@@ -137,6 +137,11 @@ def main():
         for i in range(ndim):
             axes[i].plot(batch[0, i])
             axes[i].plot(batch_denoised[0, i])
+        # fig, ax = plt.subplots()
+        # s = sample(1).cpu()
+        # ax.plot(s[0, 0])
+        # ax.plot(s[0, 1])
+        # ax.plot(s[0, 2])
         
         fig.savefig(f"output/{epoch}.png")
         plt.close(fig)

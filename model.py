@@ -31,13 +31,16 @@ def conv1d(dim: int = 64, stride: int = 1):
 class SimpleDownBlock(nn.Module):
     def __init__(self, dim: int = 64):
         super().__init__()
-        self.conv1 = conv1d(dim=dim, stride=2)
+        self.conv1 = conv1d(dim=dim, stride=1)
         self.conv2 = conv1d(dim=dim, stride=1)
+        self.conv_res = conv1d(dim=dim, stride=1)
+        self.conv_down = conv1d(dim=dim, stride=2)
 
     def forward(self, x):
+        res = self.conv_res(x)
         out1 = self.conv1(x)
         out2 = self.conv2(out1)
-        return out1 + out2
+        return self.conv_down(out2 + res)
 
 class SimpleUpBlock(nn.Module):
     def __init__(self, dim: int = 64):
@@ -77,15 +80,15 @@ class TemporalUnet(nn.Module):
 
         module_list = []
         
-        module_list.append(SimpleDownBlock(64))
+        module_list.append(SimpleDownBlock(128))
         module_list.append(SimpleDownBlock(128))
         module_list.append(SimpleDownBlock(128))
         self.downsample = nn.ModuleList(module_list)
 
         module_list = []
         module_list.append(SimpleUpBlock(128))
-        module_list.append(SimpleUpBlock(64))
-        module_list.append(SimpleUpBlock(64))
+        module_list.append(SimpleUpBlock(128))
+        module_list.append(SimpleUpBlock(128))
         self.upsample = nn.ModuleList(module_list)
 
         self.initial = nn.Sequential(
@@ -96,7 +99,7 @@ class TemporalUnet(nn.Module):
         self.final = nn.Sequential(
             nn.LazyConv1d(64, kernel_size=3, padding=1),
             nn.SELU(),
-            nn.LazyConv1d(output_dim, kernel_size=3, padding=1),
+            nn.LazyConv1d(output_dim, kernel_size=1),
         )
     
     def forward(self, x: torch.Tensor, t: torch.Tensor):
