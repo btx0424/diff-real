@@ -4,8 +4,10 @@ import einops
 import matplotlib.pyplot as plt
 import imageio
 import os
+import argparse
+
 from tqdm import tqdm
-from diffusers import UNet1DModel, DDPMScheduler, DDPMPipeline
+from diffusers import DDPMScheduler, DDIMScheduler, DDIMPipeline
 from diffusers.optimization import get_cosine_schedule_with_warmup
 
 from dataclasses import dataclass
@@ -15,7 +17,7 @@ class TrainingConfig:
     image_size = 128  # the generated image resolution
     train_batch_size = 16
     eval_batch_size = 16  # how many images to sample during evaluation
-    num_epochs = 50
+    num_epochs = 100
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
     lr_warmup_steps = 500
@@ -34,12 +36,17 @@ config = TrainingConfig()
 
 def make_dataset(path: str, seq_len = 64):
     trajs = torch.load(path)
-    print(trajs)
-    trajs = trajs["state_"][:, :, :3]
+    # print(trajs)
+    trajs = trajs["state_"][:, :, :18]
+    trajs[:, :, :3] /= 10
+    # trajs[:, :, :3] /= torch.pi
+    # trajs[:, :, 6:18] /= torch.pi
+    # trajs[:, :, 18:30] /= torch.pi
     
-    plt.plot(trajs[0, :500, 0])
-    plt.plot(trajs[0, :500, 1])
-    plt.plot(trajs[0, :500, 2])
+    ndim = min(trajs.shape[2], 8)
+    fig, axes = plt.subplots(ndim)
+    for i in range(ndim):
+        axes[i].plot(trajs[0, :500, i])
     plt.show()
     
     N, T = trajs.shape[:2]
@@ -50,9 +57,18 @@ def make_dataset(path: str, seq_len = 64):
 
 
 def main():
-    device = "cuda"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sampler", "-s", type=str, default="ddpm")
+    args = parser.parse_args()
 
-    noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+    device = "cuda"
+    
+    sampler = {"ddpm": DDPMScheduler, "ddim": DDIMScheduler}[args.sampler]
+
+    noise_scheduler: DDPMScheduler = sampler(
+        num_train_timesteps=1000,
+        clip_sample_range=3.0
+    )
 
     with torch.device(device):
         N = 8192
@@ -68,11 +84,11 @@ def main():
         x = einops.rearrange(x, 'b t d -> b d t')
         print(x.shape)
 
-    dataset = make_dataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-24_16-27.pt")
+    dataset = make_dataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-25_12-28.pt")
     # dataset = x
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=256)
+    dataloader_train = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=True)
     
-    example = next(iter(dataloader))
+    example = next(iter(dataloader_train))
     _, D, T = example.shape
 
     print(example.shape)
@@ -84,7 +100,7 @@ def main():
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=config.lr_warmup_steps,
-        num_training_steps=(len(dataloader) * config.num_epochs),
+        num_training_steps=(len(dataloader_train) * config.num_epochs),
     )
 
     # @torch.compile
@@ -112,40 +128,61 @@ def main():
         return s
     
     @torch.inference_mode()
-    def denoise(batch: torch.Tensor):
+    def denoise(batch: torch.Tensor, steps=5):
         noise_scheduler.set_timesteps(100)
         s = batch.clone()
-        for t in noise_scheduler.timesteps[-5:]:
+        for t in noise_scheduler.timesteps[-steps:]:
+            model_output = model(s, t.to(device).expand(batch.shape[0]))
+            s = noise_scheduler.step(model_output, t, s).prev_sample
+        return s
+    
+    @torch.inference_mode()
+    def noise_denoise(batch: torch.Tensor, steps=5):
+        noise_scheduler.set_timesteps(100)
+        s = batch.clone()
+
+        noise = torch.randn_like(s)
+        s = noise_scheduler.add_noise(s, noise, torch.tensor(steps))
+
+        for t in noise_scheduler.timesteps[-steps:]:
             model_output = model(s, t.to(device).expand(batch.shape[0]))
             s = noise_scheduler.step(model_output, t, s).prev_sample
         return s
     
     os.makedirs("output", exist_ok=True)
     for epoch in range(config.num_epochs):
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+        pbar = tqdm(dataloader_train, desc=f"Epoch {epoch}")
         for i, batch in enumerate(pbar):
             loss = train_step(batch.to(device))
             lr_scheduler.step()
-            
             if i % 100 == 0:
-                print(loss.item())
+                pbar.set_postfix({"loss": loss.item()})
 
-        batch_denoised = denoise(batch.to(device)).cpu()
-        ndim = 3
-        fig, axes = plt.subplots(ndim, 1, figsize=(16, 6))
+        if epoch % 10 == 0:
+            # error = 0
+            # for i, batch in enumerate(dataloader_eval):
+            #     batch = batch.to(device)
+            #     batch_denoised = denoise(batch)
+            #     error += einops.reduce((batch - batch_denoised).square(), "b d t -> d", "mean")
+            # error = error / len(dataloader_eval)
+            # print(error.tolist())
 
-        for i in range(ndim):
-            axes[i].plot(batch[0, i])
-            axes[i].plot(batch_denoised[0, i])
-        # fig, ax = plt.subplots()
-        # s = sample(1).cpu()
-        # ax.plot(s[0, 0])
-        # ax.plot(s[0, 1])
-        # ax.plot(s[0, 2])
-        
-        fig.savefig(f"output/{epoch}.png")
-        plt.close(fig)
-        
+            batch_denoised = denoise(batch.to(device))
+            batch_noised_denoised = noise_denoise(batch.to(device))
+            ndim = min(batch.shape[1], 18)
+            fig, axes = plt.subplots(ndim, 1, figsize=(16, 15))
+
+            for i in range(ndim):
+                axes[i].plot(batch[0, i].cpu(), label="original")
+                axes[i].plot(batch_denoised[0, i].cpu(), label="denoised")
+                axes[i].plot(batch_noised_denoised[0, i].cpu(), label="noised denoised")
+                axes[i].legend()
+
+            fig.suptitle(f"Epoch {epoch}")
+            fig.savefig(f"output/{epoch}.png")
+            plt.close(fig)
+    
+    torch.save(model, "model.pt")
 
 if __name__ == "__main__":
     main()
