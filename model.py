@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import einops
+import einops.layers.torch as ein
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -48,10 +49,12 @@ class SimpleUpBlock(nn.Module):
         self.conv1 = conv1d(dim=dim, stride=1)
         self.conv2 = conv1d(dim=dim, stride=1)
         self.up = nn.Sequential(
-            nn.LazyConvTranspose1d(64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.GroupNorm(8, 64),
+            nn.LazyConvTranspose1d(dim, kernel_size=3, stride=2, padding=1, output_padding=1),
+            # nn.LazyConv1d(dim * 2, kernel_size=1),
+            # ein.Rearrange("b (c u) l -> b c (u l)", u=2),
+            nn.GroupNorm(8, dim),
             nn.Mish(),
-            nn.LazyConv1d(64, kernel_size=3, padding=1),
+            nn.LazyConv1d(dim, kernel_size=3, padding=1),
             nn.Mish(),
         )
 
@@ -68,6 +71,7 @@ class TemporalUnet(nn.Module):
         self, 
         output_dim: int,
         time_dim: int=32,
+        fourier_features: int=-1,
     ) -> None:
         super().__init__()
 
@@ -80,7 +84,7 @@ class TemporalUnet(nn.Module):
 
         module_list = []
         
-        module_list.append(SimpleDownBlock(128))
+        module_list.append(SimpleDownBlock(64))
         module_list.append(SimpleDownBlock(128))
         module_list.append(SimpleDownBlock(128))
         self.downsample = nn.ModuleList(module_list)
@@ -88,7 +92,7 @@ class TemporalUnet(nn.Module):
         module_list = []
         module_list.append(SimpleUpBlock(128))
         module_list.append(SimpleUpBlock(128))
-        module_list.append(SimpleUpBlock(128))
+        module_list.append(SimpleUpBlock(64))
         self.upsample = nn.ModuleList(module_list)
 
         self.initial = nn.Sequential(
@@ -101,6 +105,9 @@ class TemporalUnet(nn.Module):
             nn.SELU(),
             nn.LazyConv1d(output_dim, kernel_size=1),
         )
+        if fourier_features > 0:
+            self.register_buffer("B", 0.1 * torch.randn(fourier_features, 18))
+            self.B: torch.Tensor
     
     def forward(self, x: torch.Tensor, t: torch.Tensor):
         """
@@ -112,6 +119,9 @@ class TemporalUnet(nn.Module):
             (B, output_dim, T)
         """
         t = torch.atleast_1d(t)
+        if hasattr(self, "B"):
+            Bx = self.B @ x
+            x = torch.cat([x, torch.sin(Bx), torch.cos(Bx)], dim=1)
         x = self.initial(x)
         time_emb = einops.repeat(self.time_mlp(t), "b d -> b d t", t=x.shape[-1])
         x = torch.cat([x, time_emb], dim=1)

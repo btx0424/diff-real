@@ -17,7 +17,7 @@ class TrainingConfig:
     image_size = 128  # the generated image resolution
     train_batch_size = 16
     eval_batch_size = 16  # how many images to sample during evaluation
-    num_epochs = 100
+    num_epochs = 10
     gradient_accumulation_steps = 1
     learning_rate = 1e-4
     lr_warmup_steps = 500
@@ -34,26 +34,36 @@ class TrainingConfig:
 
 config = TrainingConfig()
 
-def make_dataset(path: str, seq_len = 64):
-    trajs = torch.load(path)
-    # print(trajs)
-    trajs = trajs["state_"][:, :, :18]
-    trajs[:, :, :3] /= 10
-    # trajs[:, :, :3] /= torch.pi
-    # trajs[:, :, 6:18] /= torch.pi
-    # trajs[:, :, 18:30] /= torch.pi
+
+class TrajDataset(torch.utils.data.Dataset):
+    def __init__(self, path: str, seq_len = 64):
+        super().__init__()
+        trajs = torch.load(path)
+        # print(trajs)
+        trajs = trajs["state_"][:, :, :18]
+        trajs[:, :, :3] /= 10
+        ndim = min(trajs.shape[2], 8)
+        fig, axes = plt.subplots(ndim)
+        for i in range(ndim):
+            axes[i].plot(trajs[0, :500, i])
+        plt.show()
+
+        N, T, D = trajs.shape
+
+        self.seq_len = seq_len
+        self.valid_starts = list(range(N * (T - self.seq_len - 1)))
+        self.trajs: torch.Tensor = trajs.reshape(N * T, D)
+        self.mean = self.trajs.mean(0)
+        self.std = self.trajs.std(0)
+
+        self.trajs = (self.trajs - self.mean) / self.std # (self.std * 3.)
+
+    def __len__(self):
+        return len(self.valid_starts)
     
-    ndim = min(trajs.shape[2], 8)
-    fig, axes = plt.subplots(ndim)
-    for i in range(ndim):
-        axes[i].plot(trajs[0, :500, i])
-    plt.show()
-    
-    N, T = trajs.shape[:2]
-    T = (T // seq_len) * seq_len
-    trajs = trajs[:, :T].reshape(-1, seq_len, *trajs.shape[2:])
-    trajs = einops.rearrange(trajs, 'b t d -> b d t')
-    return trajs
+    def __getitem__(self, idx):
+        start = self.valid_starts[idx]
+        return self.trajs[start : start + self.seq_len].T
 
 
 def main():
@@ -84,9 +94,9 @@ def main():
         x = einops.rearrange(x, 'b t d -> b d t')
         print(x.shape)
 
-    dataset = make_dataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-25_12-28.pt")
+    dataset = TrajDataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-25_12-28.pt")
     # dataset = x
-    dataloader_train = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=True)
+    dataloader_train = torch.utils.data.DataLoader(dataset, batch_size=512, shuffle=True)
     
     example = next(iter(dataloader_train))
     _, D, T = example.shape
@@ -156,9 +166,9 @@ def main():
             loss = train_step(batch.to(device))
             lr_scheduler.step()
             if i % 100 == 0:
-                pbar.set_postfix({"loss": loss.item()})
+                pbar.set_postfix({"loss": loss.item(), "lr": lr_scheduler.get_last_lr()[0]})
 
-        if epoch % 10 == 0:
+        if epoch % 1 == 0:
             # error = 0
             # for i, batch in enumerate(dataloader_eval):
             #     batch = batch.to(device)
