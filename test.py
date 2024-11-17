@@ -40,8 +40,8 @@ class TrajDataset(torch.utils.data.Dataset):
         super().__init__()
         trajs = torch.load(path)
         # print(trajs)
-        trajs = trajs["state_"][:, :, :18]
-        trajs[:, :, :3] /= 10
+        trajs = trajs["state_"][:, :, :3 + 12 + 12]
+        # trajs[:, :, :3] /= 10
         ndim = min(trajs.shape[2], 8)
         fig, axes = plt.subplots(ndim)
         for i in range(ndim):
@@ -55,8 +55,6 @@ class TrajDataset(torch.utils.data.Dataset):
         self.trajs: torch.Tensor = trajs.reshape(N * T, D)
         self.mean = self.trajs.mean(0)
         self.std = self.trajs.std(0)
-
-        self.trajs = (self.trajs - self.mean) / self.std # (self.std * 3.)
 
     def __len__(self):
         return len(self.valid_starts)
@@ -94,7 +92,7 @@ def main():
         x = einops.rearrange(x, 'b t d -> b d t')
         print(x.shape)
 
-    dataset = TrajDataset("/home/btx0424/lab/active-adaptation/scripts/trajs-10-25_12-28.pt")
+    dataset = TrajDataset("/home/btx0424/lab/active-adaptation/scripts/trajs-11-11_20-48.pt")
     # dataset = x
     dataloader_train = torch.utils.data.DataLoader(dataset, batch_size=512, shuffle=True)
     
@@ -103,8 +101,8 @@ def main():
 
     print(example.shape)
 
-    from model import TemporalUnet
-    model = TemporalUnet(output_dim=D).to(device)
+    from model import TemporalUnet, TemporalUnetImpaint
+    model = TemporalUnetImpaint(D, dataset.mean, dataset.std).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -115,6 +113,7 @@ def main():
 
     # @torch.compile
     def train_step(batch: torch.Tensor):
+        batch = model.normalize(batch)
         bs = batch.shape[0]
         noise = torch.randn_like(batch)
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=batch.device)
@@ -127,37 +126,6 @@ def main():
         loss.backward()
         optimizer.step()
         return loss
-    
-    @torch.inference_mode()
-    def sample(size: int):
-        noise_scheduler.set_timesteps(100)
-        s = torch.randn(size, D, T, device=device)
-        for t in noise_scheduler.timesteps:
-            model_output = model(s, t.to(device))
-            s = noise_scheduler.step(model_output, t, s).prev_sample
-        return s
-    
-    @torch.inference_mode()
-    def denoise(batch: torch.Tensor, steps=5):
-        noise_scheduler.set_timesteps(100)
-        s = batch.clone()
-        for t in noise_scheduler.timesteps[-steps:]:
-            model_output = model(s, t.to(device).expand(batch.shape[0]))
-            s = noise_scheduler.step(model_output, t, s).prev_sample
-        return s
-    
-    @torch.inference_mode()
-    def noise_denoise(batch: torch.Tensor, steps=5):
-        noise_scheduler.set_timesteps(100)
-        s = batch.clone()
-
-        noise = torch.randn_like(s)
-        s = noise_scheduler.add_noise(s, noise, torch.tensor(steps))
-
-        for t in noise_scheduler.timesteps[-steps:]:
-            model_output = model(s, t.to(device).expand(batch.shape[0]))
-            s = noise_scheduler.step(model_output, t, s).prev_sample
-        return s
     
     os.makedirs("output", exist_ok=True)
     for epoch in range(config.num_epochs):
@@ -176,9 +144,10 @@ def main():
             #     error += einops.reduce((batch - batch_denoised).square(), "b d t -> d", "mean")
             # error = error / len(dataloader_eval)
             # print(error.tolist())
-
-            batch_denoised = denoise(batch.to(device))
-            batch_noised_denoised = noise_denoise(batch.to(device))
+            batch = batch.to(device)
+            cond = batch[:, :, 0].unsqueeze(-1)
+            batch_denoised = model.denoise(batch, cond, noise_scheduler)
+            batch_noised_denoised = model.noise_denoise(batch, cond, noise_scheduler)
             ndim = min(batch.shape[1], 18)
             fig, axes = plt.subplots(ndim, 1, figsize=(16, 15))
 
@@ -192,7 +161,7 @@ def main():
             fig.savefig(f"output/{epoch}.png")
             plt.close(fig)
     
-    torch.save(model, "model.pt")
+        torch.save(model, f"ckpt-{epoch}.pt")
 
 if __name__ == "__main__":
     main()

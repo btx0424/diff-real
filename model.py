@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import einops
 import einops.layers.torch as ein
-
+from diffusers import DDPMScheduler, DDIMScheduler
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -70,10 +70,14 @@ class TemporalUnet(nn.Module):
     def __init__(
         self, 
         output_dim: int,
+        mean: torch.Tensor,
+        std: torch.Tensor,
         time_dim: int=32,
         fourier_features: int=-1,
     ) -> None:
         super().__init__()
+        self.output_dim = output_dim
+        self.time_dim = time_dim
 
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_dim),
@@ -108,6 +112,19 @@ class TemporalUnet(nn.Module):
         if fourier_features > 0:
             self.register_buffer("B", 0.1 * torch.randn(fourier_features, 18))
             self.B: torch.Tensor
+        
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+        self.mean: torch.Tensor
+        self.std: torch.Tensor
+    
+    @torch.no_grad()
+    def normalize(self, x: torch.Tensor):
+        return (x - self.mean.unsqueeze(-1)) / self.std.unsqueeze(-1)
+    
+    @torch.no_grad()
+    def denormalize(self, x: torch.Tensor):
+        return x * self.std.unsqueeze(-1) + self.mean.unsqueeze(-1)
     
     def forward(self, x: torch.Tensor, t: torch.Tensor):
         """
@@ -139,4 +156,74 @@ class TemporalUnet(nn.Module):
         
         x = self.final(x)
         return x
+
+    # @torch.inference_mode()
+    # def sample(self, size: int, noise_scheduler):
+    #     noise_scheduler.set_timesteps(100)
         
+    #     s = torch.randn(size, self.output_dim, self.time_dim, device=device)
+    #     for t in noise_scheduler.timesteps:
+    #         model_output = self(s, t.to(device))
+    #         s = noise_scheduler.step(model_output, t, s).prev_sample
+    #     return s
+    
+    @torch.inference_mode()
+    def denoise(self, batch: torch.Tensor, noise_scheduler, steps=5):
+        s = self.normalize(batch)
+        noise_scheduler.set_timesteps(100)
+        device = batch.device
+        for t in noise_scheduler.timesteps[-steps:]:
+            model_output = self(s, t.to(device).expand(batch.shape[0]))
+            s = noise_scheduler.step(model_output, t, s).prev_sample
+        return self.denormalize(s)
+        
+    @torch.inference_mode()
+    def noise_denoise(self, batch: torch.Tensor, noise_scheduler, steps=5):
+        s = self.normalize(batch)
+        noise_scheduler.set_timesteps(100)
+        device = batch.device
+
+        noise = torch.randn_like(s)
+        s = noise_scheduler.add_noise(s, noise, torch.tensor(steps))
+        for t in noise_scheduler.timesteps[-steps:]:
+            model_output = self(s, t.to(device).expand(batch.shape[0]))
+            s = noise_scheduler.step(model_output, t, s).prev_sample
+        return self.denormalize(s)
+
+
+class TemporalUnetImpaint(TemporalUnet):
+    
+    def denoise(self, batch: torch.Tensor, cond: torch.Tensor, noise_scheduler, steps=5):
+        assert batch.shape[:2] == cond.shape[:2], (batch.shape, cond.shape)
+        if cond.ndim == 2:
+            cond = cond.unsqueeze(-1)
+        s = self.normalize(batch)
+        cond = self.normalize(cond) # [N, D, T']
+        
+        noise_scheduler.set_timesteps(100)
+        device = batch.device
+        
+        for t in noise_scheduler.timesteps[-steps:]:
+            model_output = self(s, t.to(device).expand(batch.shape[0]))
+            s = noise_scheduler.step(model_output, t, s).prev_sample
+            s[:, :, :cond.shape[-1]] = cond
+        return self.denormalize(s)
+    
+    def noise_denoise(self, batch: torch.Tensor, cond: torch.Tensor, noise_scheduler, steps=5):
+        assert batch.shape[:2] == cond.shape[:2], (batch.shape, cond.shape)
+        if cond.ndim == 2:
+            cond = cond.unsqueeze(-1)
+        s = self.normalize(batch)
+        cond = self.normalize(cond) # [N, D, T']
+
+        noise_scheduler.set_timesteps(100)
+        device = batch.device
+
+        noise = torch.randn_like(s)
+        s = noise_scheduler.add_noise(s, noise, torch.tensor(steps))
+        for t in noise_scheduler.timesteps[-steps:]:
+            model_output = self(s, t.to(device).expand(batch.shape[0]))
+            s = noise_scheduler.step(model_output, t, s).prev_sample
+            s[:, :, :cond.shape[-1]] = cond
+        return self.denormalize(s)
+
